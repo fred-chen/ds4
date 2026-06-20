@@ -1653,7 +1653,9 @@ static int dist_connect_endpoint_once(const char *host, int port,
 
 static int dist_connect_endpoint(const char *host, int port, char *err,
                                  size_t errlen) {
-  /* When the host is localhost, try UDS first for lower latency. */
+  /* When the host is localhost, prefer UDS exclusively.  Keep retrying
+   * UDS until the coordinator appears — do not fall back to TCP, because
+   * the outer reconnect loop already handles reconnection. */
   if (dist_is_localhost(host)) {
     char uds_path[256];
     dist_uds_make_path(uds_path, sizeof(uds_path), port);
@@ -1667,14 +1669,10 @@ static int dist_connect_endpoint(const char *host, int port, char *err,
       struct timespec ts = {0, 25 * 1000 * 1000};
       nanosleep(&ts, NULL);
     }
-    fprintf(stderr,
-            "ds4: distributed worker: UDS connect to %s failed (%s), falling "
-            "back to TCP\n",
-            uds_path, err);
+    return -1;
   }
 
-  /* Fall back to normal TCP connection (works for both localhost and remote).
-   */
+  /* Normal TCP connection for remote hosts. */
   int last_errno = 0;
   for (int attempt = 0; attempt < 200; attempt++) {
     int fd = dist_connect_endpoint_once(host, port, &last_errno, err, errlen);
