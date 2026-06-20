@@ -34,6 +34,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -253,6 +254,7 @@ typedef struct {
 typedef struct {
   ds4_dist_coordinator_state *state;
   int listen_fd;
+  int uds_fd; /* Unix domain socket listener fd, -1 if not active */
 } ds4_dist_accept_ctx;
 
 typedef struct ds4_dist_worker_session {
@@ -271,6 +273,7 @@ typedef struct {
   bool has_output;
   int ctx_size;
   int listen_fd;
+  int uds_fd; /* Unix domain socket listener fd, -1 if not active */
   pthread_mutex_t mu;
   ds4_dist_worker_session *sessions;
 } ds4_dist_worker_state;
@@ -1066,6 +1069,114 @@ static int dist_decode_activation_payload(const void *wire, uint32_t bits,
 }
 
 /* =========================================================================
+ * Unix Domain Socket Helpers
+ * ========================================================================= */
+
+/* Detect whether the host string refers to the local machine. */
+static bool dist_is_localhost(const char *host) {
+  if (!host)
+    return false;
+  return (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 ||
+          strcmp(host, "localhost") == 0);
+}
+
+/* Generate a UDS socket path based on the port number.
+ * Path: /tmp/ds4_uds_<port>.sock */
+static void dist_uds_make_path(char *buf, size_t buflen, int port) {
+  snprintf(buf, buflen, "/tmp/ds4_uds_%d.sock", port);
+}
+
+/* Create a Unix domain socket listener on the given path.
+ * Returns a socket fd on success, -1 on failure. */
+static int dist_create_uds_listener(const char *path, char *err,
+                                    size_t errlen) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    if (errlen)
+      snprintf(err, errlen, "UDS socket: %s", strerror(errno));
+    return -1;
+  }
+
+  struct sockaddr_un addr = {0};
+  addr.sun_family = AF_UNIX;
+
+  size_t path_len = strlen(path);
+  if (path_len >= sizeof(addr.sun_path)) {
+    if (errlen)
+      snprintf(err, errlen, "UDS path too long");
+    close(fd);
+    return -1;
+  }
+
+  memcpy(addr.sun_path, path, path_len);
+
+  /* Remove stale socket file to avoid "Address already in use". */
+  unlink(path);
+
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (errlen)
+      snprintf(err, errlen, "UDS bind: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  if (listen(fd, 64) < 0) {
+    if (errlen)
+      snprintf(err, errlen, "UDS listen: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+/* Connect to a Unix domain socket at the given path.
+ * Returns a socket fd on success, -1 on failure. */
+static int dist_connect_uds_once(const char *path, int *last_errno, char *err,
+                                 size_t errlen) {
+  if (last_errno)
+    *last_errno = 0;
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    int e = errno;
+    if (errlen)
+      snprintf(err, errlen, "UDS socket: %s", strerror(e));
+    if (last_errno)
+      *last_errno = e;
+    return -1;
+  }
+
+  struct sockaddr_un addr = {0};
+  addr.sun_family = AF_UNIX;
+
+  size_t path_len = strlen(path);
+  if (path_len >= sizeof(addr.sun_path)) {
+    int e = EINVAL;
+    if (errlen)
+      snprintf(err, errlen, "UDS path too long");
+    if (last_errno)
+      *last_errno = e;
+    close(fd);
+    return -1;
+  }
+
+  memcpy(addr.sun_path, path, path_len);
+
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    int e = errno;
+    if (errlen)
+      snprintf(err, errlen, "UDS connect: %s", strerror(e));
+    if (last_errno)
+      *last_errno = e;
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+/* =========================================================================
  * TCP Framing And Connections
  * ========================================================================= */
 
@@ -1542,6 +1653,28 @@ static int dist_connect_endpoint_once(const char *host, int port,
 
 static int dist_connect_endpoint(const char *host, int port, char *err,
                                  size_t errlen) {
+  /* When the host is localhost, try UDS first for lower latency. */
+  if (dist_is_localhost(host)) {
+    char uds_path[256];
+    dist_uds_make_path(uds_path, sizeof(uds_path), port);
+    int last_errno = 0;
+    for (int attempt = 0; attempt < 200; attempt++) {
+      int fd = dist_connect_uds_once(uds_path, &last_errno, err, errlen);
+      if (fd >= 0)
+        return fd;
+      if (last_errno != ECONNREFUSED && last_errno != ENOENT)
+        break;
+      struct timespec ts = {0, 25 * 1000 * 1000};
+      nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "ds4: distributed worker: UDS connect to %s failed (%s), falling "
+            "back to TCP\n",
+            uds_path, err);
+  }
+
+  /* Fall back to normal TCP connection (works for both localhost and remote).
+   */
   int last_errno = 0;
   for (int attempt = 0; attempt < 200; attempt++) {
     int fd = dist_connect_endpoint_once(host, port, &last_errno, err, errlen);
@@ -4336,54 +4469,108 @@ static void *dist_coordinator_client_main(void *arg) {
   return NULL;
 }
 
+/* Accept a connection from either TCP or UDS listener and spawn a client
+ * handling thread.  Returns 0 on success, 1 when both listeners are closed. */
+static int dist_coordinator_accept_one(ds4_dist_accept_ctx *accept_ctx) {
+  ds4_dist_coordinator_state *state = accept_ctx->state;
+  int tcp_fd = accept_ctx->listen_fd;
+  int uds_fd = accept_ctx->uds_fd;
+
+  /* Use poll() to wait for readiness on both listeners simultaneously. */
+  struct pollfd fds[2];
+  int nfds = 0;
+
+  if (tcp_fd >= 0) {
+    fds[nfds].fd = tcp_fd;
+    fds[nfds].events = POLLIN;
+    nfds++;
+  }
+  if (uds_fd >= 0) {
+    fds[nfds].fd = uds_fd;
+    fds[nfds].events = POLLIN;
+    nfds++;
+  }
+
+  if (nfds == 0)
+    return 1;
+
+  int poll_rc = poll(fds, (nfds_t)nfds, -1);
+  if (poll_rc < 0) {
+    if (errno == EINTR)
+      return 0;
+    DIST_COORD_DEBUG(state, "ds4: distributed coordinator: poll failed: %s\n",
+                     strerror(errno));
+    return 0;
+  }
+
+  /* Determine which fd(s) are ready and accept the first one. */
+  int chosen_fd = -1;
+  for (int i = 0; i < nfds; i++) {
+    if (fds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
+      chosen_fd = fds[i].fd;
+      break;
+    }
+  }
+
+  if (chosen_fd < 0)
+    return 0;
+
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof(ss);
+  int fd = accept(chosen_fd, (struct sockaddr *)&ss, &slen);
+  if (fd < 0) {
+    if (errno == EINTR)
+      return 0;
+    if (errno == EBADF || errno == EINVAL) {
+      /* Mark the bad fd as closed to disable it. */
+      if (chosen_fd == tcp_fd)
+        accept_ctx->listen_fd = -1;
+      else if (chosen_fd == uds_fd)
+        accept_ctx->uds_fd = -1;
+      return 0;
+    }
+    DIST_COORD_DEBUG(state, "ds4: distributed coordinator: accept failed: %s\n",
+                     strerror(errno));
+    return 0;
+  }
+  dist_set_socket_low_latency(fd);
+
+  ds4_dist_client_ctx *ctx = calloc(1, sizeof(*ctx));
+  if (!ctx) {
+    DIST_COORD_DEBUG(state,
+                     "ds4: distributed coordinator: out of memory accepting "
+                     "worker\n");
+    close(fd);
+    return 0;
+  }
+  ctx->state = state;
+  ctx->fd = fd;
+  if (getnameinfo((struct sockaddr *)&ss, slen, ctx->peer_host,
+                  sizeof(ctx->peer_host), ctx->peer_port,
+                  sizeof(ctx->peer_port),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
+    snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
+  }
+
+  pthread_t tid;
+  if (pthread_create(&tid, NULL, dist_coordinator_client_main, ctx) != 0) {
+    DIST_COORD_DEBUG(state,
+                     "ds4: distributed coordinator: pthread_create failed\n");
+    close(fd);
+    free(ctx);
+    return 0;
+  }
+  pthread_detach(tid);
+  return 0;
+}
+
 static void *dist_coordinator_accept_main(void *arg) {
   ds4_dist_accept_ctx *accept_ctx = arg;
-  int listen_fd = accept_ctx->listen_fd;
-  ds4_dist_coordinator_state *state = accept_ctx->state;
 
   for (;;) {
-    struct sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-    int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
-    if (fd < 0) {
-      if (errno == EINTR)
-        continue;
-      if (errno == EBADF || errno == EINVAL)
-        break;
-      DIST_COORD_DEBUG(state,
-                       "ds4: distributed coordinator: accept failed: %s\n",
-                       strerror(errno));
-      continue;
-    }
-    dist_set_socket_low_latency(fd);
-
-    ds4_dist_client_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-      DIST_COORD_DEBUG(
-          state,
-          "ds4: distributed coordinator: out of memory accepting worker\n");
-      close(fd);
-      continue;
-    }
-    ctx->state = state;
-    ctx->fd = fd;
-    if (getnameinfo((struct sockaddr *)&ss, slen, ctx->peer_host,
-                    sizeof(ctx->peer_host), ctx->peer_port,
-                    sizeof(ctx->peer_port),
-                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-      snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
-      snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
-    }
-
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, dist_coordinator_client_main, ctx) != 0) {
-      DIST_COORD_DEBUG(state,
-                       "ds4: distributed coordinator: pthread_create failed\n");
-      close(fd);
-      free(ctx);
-      continue;
-    }
-    pthread_detach(tid);
+    if (dist_coordinator_accept_one(accept_ctx) != 0)
+      break;
   }
   return NULL;
 }
@@ -5533,6 +5720,23 @@ int ds4_dist_session_create(ds4_dist_session **out, ds4_engine *engine,
    */
   d->snapshot_request_id = UINT64_C(1) << 63;
 
+  /* Optionally open a UDS listener when the host is localhost (or default
+   * listen-on-all-interfaces, which includes localhost). */
+  int uds_fd = -1;
+  char uds_err[256];
+  if (opt->listen_host == NULL || dist_is_localhost(opt->listen_host)) {
+    char uds_path[256];
+    int port_i = dist_listener_port(listen_fd);
+    dist_uds_make_path(uds_path, sizeof(uds_path), port_i);
+    uds_fd = dist_create_uds_listener(uds_path, uds_err, sizeof(uds_err));
+    if (uds_fd < 0) {
+      fprintf(stderr,
+              "ds4: distributed coordinator: UDS listener disabled (%s)\n",
+              uds_err);
+      uds_fd = -1;
+    }
+  }
+
   char local_end[32];
   if (opt->layers.has_output)
     snprintf(local_end, sizeof(local_end), "output");
@@ -5547,9 +5751,12 @@ int ds4_dist_session_create(ds4_dist_session **out, ds4_engine *engine,
 
   d->accept_ctx.state = &d->state;
   d->accept_ctx.listen_fd = listen_fd;
+  d->accept_ctx.uds_fd = uds_fd;
   if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main,
                      &d->accept_ctx) != 0) {
     close(listen_fd);
+    if (uds_fd >= 0)
+      close(uds_fd);
     pthread_mutex_destroy(&d->state.mu);
     free(d);
     if (errlen)
@@ -5566,10 +5773,21 @@ int ds4_dist_session_create(ds4_dist_session **out, ds4_engine *engine,
 void ds4_dist_session_free(ds4_dist_session *d) {
   if (!d)
     return;
+  /* Capture the port before closing the TCP listener. */
+  int port_i = 0;
   if (d->listen_fd >= 0) {
+    port_i = dist_listener_port(d->listen_fd);
     shutdown(d->listen_fd, SHUT_RDWR);
     close(d->listen_fd);
     d->listen_fd = -1;
+  }
+  if (d->accept_ctx.uds_fd >= 0) {
+    char uds_path[256];
+    dist_uds_make_path(uds_path, sizeof(uds_path), port_i);
+    shutdown(d->accept_ctx.uds_fd, SHUT_RDWR);
+    close(d->accept_ctx.uds_fd);
+    unlink(uds_path);
+    d->accept_ctx.uds_fd = -1;
   }
   dist_route_plan_free(&d->plan);
   pthread_mutex_lock(&d->state.mu);
@@ -5767,9 +5985,27 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
                    state.n_layers, opt->layers.start, local_end,
                    state.activation_bits);
 
+  /* Optionally open a UDS listener when the host is localhost (or default
+   * listen-on-all-interfaces, which includes localhost). */
+  int uds_fd = -1;
+  char uds_err[256];
+  if (opt->listen_host == NULL || dist_is_localhost(opt->listen_host)) {
+    char uds_path[256];
+    int port_i = dist_listener_port(listen_fd);
+    dist_uds_make_path(uds_path, sizeof(uds_path), port_i);
+    uds_fd = dist_create_uds_listener(uds_path, uds_err, sizeof(uds_err));
+    if (uds_fd < 0) {
+      fprintf(stderr,
+              "ds4: distributed coordinator: UDS listener disabled (%s)\n",
+              uds_err);
+      uds_fd = -1;
+    }
+  }
+
   ds4_dist_accept_ctx accept_ctx = {
       .state = &state,
       .listen_fd = listen_fd,
+      .uds_fd = uds_fd,
   };
   if (!gen || !gen->prompt) {
     dist_coordinator_accept_main(&accept_ctx);
@@ -5782,6 +6018,8 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     fprintf(stderr, "ds4: distributed coordinator: pthread_create failed for "
                     "accept loop\n");
     close(listen_fd);
+    if (uds_fd >= 0)
+      close(uds_fd);
     return 1;
   }
   pthread_detach(accept_tid);
@@ -7994,49 +8232,103 @@ static void *dist_worker_data_client_main(void *arg) {
   return NULL;
 }
 
+/* Helper: accept a data connection from either TCP or UDS listener. */
+static int dist_worker_data_accept_one(ds4_dist_worker_state *state) {
+  int tcp_fd = state->listen_fd;
+  int uds_fd = state->uds_fd;
+
+  struct pollfd fds[2];
+  int nfds = 0;
+
+  if (tcp_fd >= 0) {
+    fds[nfds].fd = tcp_fd;
+    fds[nfds].events = POLLIN;
+    nfds++;
+  }
+  if (uds_fd >= 0) {
+    fds[nfds].fd = uds_fd;
+    fds[nfds].events = POLLIN;
+    nfds++;
+  }
+
+  if (nfds == 0)
+    return 1;
+
+  int poll_rc = poll(fds, (nfds_t)nfds, -1);
+  if (poll_rc < 0) {
+    if (errno == EINTR)
+      return 0;
+    fprintf(stderr, "ds4: distributed worker: poll failed: %s\n",
+            strerror(errno));
+    return 0;
+  }
+
+  int chosen_fd = -1;
+  for (int i = 0; i < nfds; i++) {
+    if (fds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
+      chosen_fd = fds[i].fd;
+      break;
+    }
+  }
+
+  if (chosen_fd < 0)
+    return 0;
+
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof(ss);
+  int fd = accept(chosen_fd, (struct sockaddr *)&ss, &slen);
+  if (fd < 0) {
+    if (errno == EINTR)
+      return 0;
+    if (errno == EBADF || errno == EINVAL) {
+      if (chosen_fd == tcp_fd)
+        state->listen_fd = -1;
+      else if (chosen_fd == uds_fd)
+        state->uds_fd = -1;
+      return 0;
+    }
+    fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n",
+            strerror(errno));
+    return 0;
+  }
+  dist_set_socket_low_latency(fd);
+
+  ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
+  if (!ctx) {
+    fprintf(
+        stderr,
+        "ds4: distributed worker: out of memory accepting data connection\n");
+    close(fd);
+    return 0;
+  }
+  ctx->state = state;
+  ctx->fd = fd;
+  if (getnameinfo((struct sockaddr *)&ss, slen, ctx->peer_host,
+                  sizeof(ctx->peer_host), ctx->peer_port,
+                  sizeof(ctx->peer_port),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
+    snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
+  }
+
+  pthread_t tid;
+  if (pthread_create(&tid, NULL, dist_worker_data_client_main, ctx) != 0) {
+    fprintf(stderr, "ds4: distributed worker: pthread_create failed for data "
+                    "connection\n");
+    close(fd);
+    free(ctx);
+    return 0;
+  }
+  pthread_detach(tid);
+  return 0;
+}
+
 static void *dist_worker_data_listener_main(void *arg) {
   ds4_dist_worker_state *state = arg;
-  int listen_fd = state->listen_fd;
+
   for (;;) {
-    struct sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-    int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
-    if (fd < 0) {
-      if (errno == EINTR)
-        continue;
-      fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n",
-              strerror(errno));
-      continue;
-    }
-    dist_set_socket_low_latency(fd);
-
-    ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-      fprintf(
-          stderr,
-          "ds4: distributed worker: out of memory accepting data connection\n");
-      close(fd);
-      continue;
-    }
-    ctx->state = state;
-    ctx->fd = fd;
-    if (getnameinfo((struct sockaddr *)&ss, slen, ctx->peer_host,
-                    sizeof(ctx->peer_host), ctx->peer_port,
-                    sizeof(ctx->peer_port),
-                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-      snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
-      snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
-    }
-
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, dist_worker_data_client_main, ctx) != 0) {
-      fprintf(stderr, "ds4: distributed worker: pthread_create failed for data "
-                      "connection\n");
-      close(fd);
-      free(ctx);
-      continue;
-    }
-    pthread_detach(tid);
+    if (dist_worker_data_accept_one(state) != 0)
+      break;
   }
   return NULL;
 }
@@ -8072,6 +8364,21 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt,
   }
   const uint32_t listen_port = (uint32_t)listen_port_i;
 
+  /* Optionally open a UDS listener when the host is localhost (or default
+   * listen-on-all-interfaces, which includes localhost). */
+  int uds_fd = -1;
+  char uds_err[256];
+  if (listen_host == NULL || dist_is_localhost(listen_host)) {
+    char uds_path[256];
+    dist_uds_make_path(uds_path, sizeof(uds_path), listen_port_i);
+    uds_fd = dist_create_uds_listener(uds_path, uds_err, sizeof(uds_err));
+    if (uds_fd < 0) {
+      fprintf(stderr, "ds4: distributed worker: UDS listener disabled (%s)\n",
+              uds_err);
+      uds_fd = -1;
+    }
+  }
+
   ds4_dist_worker_state state;
   memset(&state, 0, sizeof(state));
   state.engine = engine;
@@ -8082,6 +8389,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt,
   state.has_output = opt->layers.has_output;
   state.ctx_size = ctx_size;
   state.listen_fd = listen_fd;
+  state.uds_fd = uds_fd;
   pthread_mutex_init(&state.mu, NULL);
 
   pthread_t data_tid;
@@ -8091,6 +8399,8 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt,
         stderr,
         "ds4: distributed worker: pthread_create failed for data listener\n");
     close(listen_fd);
+    if (uds_fd >= 0)
+      close(uds_fd);
     return 1;
   }
   pthread_detach(data_tid);
